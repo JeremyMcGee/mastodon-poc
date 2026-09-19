@@ -128,12 +128,30 @@ When the results queue is empty:
 No result available
 ```
 
+### 4. `consume-result`
+
+Like `peek-result`, but **destructive**: it receives one result, pretty-prints
+it, and then deletes it from the queue. Use `peek-result` to look without
+consuming; use `consume-result` to take the result off the queue.
+
+```bash
+dotnet run --project src/MastodonInferencePoc -- consume-result
+```
+
+Output is identical to `peek-result` when a result is present, and prints
+`No result available` (exit code 0) when the queue is empty. The message is only
+deleted **after** it has been successfully deserialized and printed. If
+deserialization or output fails, the message is left on the queue (not deleted),
+a concise error is written to stderr, and the command exits non-zero; the
+message becomes visible again after its visibility timeout.
+
 ## End-to-end walk-through
 
 ```bash
-dotnet run --project src/MastodonInferencePoc -- enqueue-test   # queues a job
-dotnet run --project src/MastodonInferencePoc -- process-once   # job -> Ollama -> result
-dotnet run --project src/MastodonInferencePoc -- peek-result    # inspect the result
+dotnet run --project src/MastodonInferencePoc -- enqueue-test    # queues a job
+dotnet run --project src/MastodonInferencePoc -- process-once    # job -> Ollama -> result
+dotnet run --project src/MastodonInferencePoc -- peek-result     # inspect the result (non-destructive)
+dotnet run --project src/MastodonInferencePoc -- consume-result  # print and remove the result
 ```
 
 ## Azure Queue visibility & delete behaviour

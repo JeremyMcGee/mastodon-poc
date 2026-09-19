@@ -23,6 +23,9 @@ try
         case "peek-result":
             return await RunPeekResultAsync(cts.Token).ConfigureAwait(false);
 
+        case "consume-result":
+            return await RunConsumeResultAsync(cts.Token).ConfigureAwait(false);
+
         case "help":
         case "--help":
         case "-h":
@@ -95,6 +98,28 @@ static async Task<int> RunPeekResultAsync(CancellationToken cancellationToken)
     return 0;
 }
 
+static async Task<int> RunConsumeResultAsync(CancellationToken cancellationToken)
+{
+    var config = Configuration.FromEnvironment();
+    var resultsQueue = QueueInferenceAgent.CreateQueueClient(
+        config.RequireAzureStorageConnectionString(), config.ResultsQueueName);
+
+    var agent = new QueueInferenceAgent(resultsQueue, resultsQueue, CreateUnusedOllamaClient());
+
+    try
+    {
+        await agent.ConsumeResultAsync(cancellationToken).ConfigureAwait(false);
+        return 0;
+    }
+    catch (Exception ex) when (ex is not OperationCanceledException)
+    {
+        // On failure the message is left undeleted; it reappears after the
+        // visibility timeout so it can be consumed again later.
+        await Console.Error.WriteLineAsync($"consume-result failed: {ex.Message}").ConfigureAwait(false);
+        return 1;
+    }
+}
+
 static HttpClient CreateOllamaHttpClient(string baseUrl)
 {
     // Ensure a trailing slash so relative "api/generate" resolves correctly.
@@ -123,4 +148,5 @@ static void PrintUsage()
     Console.WriteLine("  enqueue-test   Send a test job to the jobs queue and print its id.");
     Console.WriteLine("  process-once   Receive one job, run Ollama, write the result, then delete the job.");
     Console.WriteLine("  peek-result    Peek (non-destructively) at one message in the results queue.");
+    Console.WriteLine("  consume-result Receive, print, and delete one message from the results queue.");
 }

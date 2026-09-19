@@ -32,6 +32,9 @@ internal sealed class FakeQueueClient : QueueClient
 
     public int SendCallCount { get; private set; }
 
+    public int ReceiveCallCount { get; private set; }
+    public int PeekCallCount { get; private set; }
+
     /// <summary>When true, SendMessageAsync throws to simulate an enqueue failure.</summary>
     public bool FailOnSend { get; set; }
 
@@ -42,8 +45,26 @@ internal sealed class FakeQueueClient : QueueClient
 
     public override Task<Response<QueueMessage>> ReceiveMessageAsync(
         TimeSpan? visibilityTimeout = null,
-        CancellationToken cancellationToken = default) =>
-        Task.FromResult(Response.FromValue(_messageToReturn!, new FakeResponse()));
+        CancellationToken cancellationToken = default)
+    {
+        ReceiveCallCount++;
+        return Task.FromResult(Response.FromValue(_messageToReturn!, new FakeResponse()));
+    }
+
+    public override Task<Response<PeekedMessage>> PeekMessageAsync(
+        CancellationToken cancellationToken = default)
+    {
+        PeekCallCount++;
+
+        PeekedMessage? peeked = _messageToReturn is null
+            ? null
+            : QueuesModelFactory.PeekedMessage(
+                messageId: _messageToReturn.MessageId,
+                message: BinaryData.FromString(_messageToReturn.MessageText),
+                dequeueCount: _messageToReturn.DequeueCount);
+
+        return Task.FromResult(Response.FromValue(peeked!, new FakeResponse()));
+    }
 
     public override Task<Response<SendReceipt>> SendMessageAsync(
         string messageText,

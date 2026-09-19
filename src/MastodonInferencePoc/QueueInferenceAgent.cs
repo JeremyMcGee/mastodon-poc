@@ -182,4 +182,44 @@ public sealed class QueueInferenceAgent
         _out.WriteLine(pretty);
         return true;
     }
+
+    /// <summary>
+    /// Receives (not peeks) at most one result message, pretty-prints it, and
+    /// only then deletes it. Unlike <see cref="PeekResultAsync"/> this is
+    /// destructive: the message is removed from the queue once consumed.
+    /// If deserialization or output fails, the message is left undeleted so it
+    /// becomes visible again after the visibility timeout. Returns true if a
+    /// result was consumed, false if the queue was empty.
+    /// </summary>
+    public async Task<bool> ConsumeResultAsync(CancellationToken cancellationToken)
+    {
+        await _resultsQueue.CreateIfNotExistsAsync(cancellationToken: cancellationToken).ConfigureAwait(false);
+
+        // Receive with a non-zero visibility timeout so the message is hidden
+        // while we process it. It is only deleted after successful output.
+        QueueMessage? message = await _resultsQueue
+            .ReceiveMessageAsync(VisibilityTimeout, cancellationToken)
+            .ConfigureAwait(false);
+
+        if (message is null)
+        {
+            _out.WriteLine("No result available");
+            return false;
+        }
+
+        // Deserialize and print first. If either throws, we fall out of the
+        // method without deleting, so the result reappears after the timeout.
+        var result = JsonSerializer.Deserialize<InferenceResult>(message.MessageText, JsonDefaults.Options)
+            ?? throw new InvalidOperationException("Result message could not be deserialized.");
+
+        var pretty = JsonSerializer.Serialize(result, JsonDefaults.PrettyOptions);
+        _out.WriteLine(pretty);
+
+        // Only now that output succeeded is it safe to remove the message.
+        await _resultsQueue
+            .DeleteMessageAsync(message.MessageId, message.PopReceipt, cancellationToken)
+            .ConfigureAwait(false);
+
+        return true;
+    }
 }
