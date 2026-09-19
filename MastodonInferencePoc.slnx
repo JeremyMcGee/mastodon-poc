@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/MastodonInferencePoc/MastodonInferencePoc.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/MastodonInferencePoc.Tests/MastodonInferencePoc.Tests.csproj" />
+  </Folder>
+</Solution>
