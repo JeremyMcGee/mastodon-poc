@@ -10,26 +10,35 @@ public class ConsumeResultTests
 {
     private const string MessageId = "result-msg-1";
     private const string PopReceipt = "result-pop-1";
+    private const string JobId = "job-abc";
 
-    private static QueueMessage BuildResultMessage(string body) =>
+    private static QueueMessage BuildTicketMessage(string body) =>
         QueuesModelFactory.QueueMessage(
             messageId: MessageId,
             popReceipt: PopReceipt,
             body: BinaryData.FromString(body),
             dequeueCount: 1);
 
-    private static QueueMessage BuildValidResultMessage()
+    private static QueueMessage BuildValidResultTicketMessage()
     {
-        var result = new InferenceResult
+        var ticket = new ResultTicket
         {
-            JobId = "job-abc",
+            JobId = JobId,
             Status = "complete",
-            Result = "Hello from Ollama via Azure Queue",
+            ResultBlob = BlobPayloadStore.ResultBlobPath(JobId),
             CompletedAt = DateTimeOffset.UtcNow,
         };
 
-        return BuildResultMessage(JsonSerializer.Serialize(result, JsonDefaults.Options));
+        return BuildTicketMessage(JsonSerializer.Serialize(ticket, JsonDefaults.Options));
     }
+
+    private static InferenceResult ResultFor(string jobId) => new()
+    {
+        JobId = jobId,
+        Status = "complete",
+        Result = "Hello from Ollama via Azure Queue",
+        CompletedAt = DateTimeOffset.UtcNow,
+    };
 
     // A placeholder OllamaClient; result commands never touch Ollama.
     private static OllamaClient UnusedOllama() =>
@@ -38,9 +47,12 @@ public class ConsumeResultTests
     [Fact]
     public async Task PeekResult_DoesNotDeleteOrHideTheResult()
     {
-        var resultsQueue = new FakeQueueClient(BuildValidResultMessage());
+        var resultsQueue = new FakeQueueClient(BuildValidResultTicketMessage());
+        var blobStore = new FakeBlobPayloadStore();
+        blobStore.SeedResult(ResultFor(JobId));
+
         var agent = new QueueInferenceAgent(
-            resultsQueue, resultsQueue, UnusedOllama(),
+            resultsQueue, resultsQueue, blobStore, UnusedOllama(),
             standardOut: TextWriter.Null);
 
         var found = await agent.PeekResultAsync(CancellationToken.None);
@@ -56,9 +68,12 @@ public class ConsumeResultTests
     [Fact]
     public async Task ConsumeResult_DeletesSuccessfullyProcessedResult()
     {
-        var resultsQueue = new FakeQueueClient(BuildValidResultMessage());
+        var resultsQueue = new FakeQueueClient(BuildValidResultTicketMessage());
+        var blobStore = new FakeBlobPayloadStore();
+        blobStore.SeedResult(ResultFor(JobId));
+
         var agent = new QueueInferenceAgent(
-            resultsQueue, resultsQueue, UnusedOllama(),
+            resultsQueue, resultsQueue, blobStore, UnusedOllama(),
             standardOut: TextWriter.Null);
 
         var consumed = await agent.ConsumeResultAsync(CancellationToken.None);
@@ -68,23 +83,75 @@ public class ConsumeResultTests
         Assert.Equal(1, resultsQueue.DeleteCallCount);
         Assert.Equal(MessageId, resultsQueue.DeletedMessageId);
         Assert.Equal(PopReceipt, resultsQueue.DeletedPopReceipt);
-        // Consume uses receive (hide), never peek.
         Assert.Equal(0, resultsQueue.PeekCallCount);
+        // Result blob is retained for diagnostics.
+        Assert.True(blobStore.HasResult(JobId));
     }
 
     [Fact]
-    public async Task ConsumeResult_LeavesFailedResultUndeleted()
+    public async Task ConsumeResult_MissingResultBlob_LeavesTicketUndeleted()
     {
-        // Body is not valid InferenceResult JSON, so deserialization/output fails.
-        var resultsQueue = new FakeQueueClient(BuildResultMessage("this is not json"));
+        // Valid ticket, but the referenced result blob was never uploaded.
+        var resultsQueue = new FakeQueueClient(BuildValidResultTicketMessage());
+        var blobStore = new FakeBlobPayloadStore();
+
         var agent = new QueueInferenceAgent(
-            resultsQueue, resultsQueue, UnusedOllama(),
+            resultsQueue, resultsQueue, blobStore, UnusedOllama(),
             standardOut: TextWriter.Null);
 
         await Assert.ThrowsAnyAsync<Exception>(
             () => agent.ConsumeResultAsync(CancellationToken.None));
 
-        // Failure before delete: message stays on the queue.
+        Assert.Equal(0, resultsQueue.DeleteCallCount);
+    }
+
+    [Fact]
+    public async Task ConsumeResult_MalformedTicket_LeavesTicketUndeleted()
+    {
+        var resultsQueue = new FakeQueueClient(BuildTicketMessage("this is not json"));
+        var blobStore = new FakeBlobPayloadStore();
+
+        var agent = new QueueInferenceAgent(
+            resultsQueue, resultsQueue, blobStore, UnusedOllama(),
+            standardOut: TextWriter.Null);
+
+        await Assert.ThrowsAnyAsync<Exception>(
+            () => agent.ConsumeResultAsync(CancellationToken.None));
+
+        Assert.Equal(0, resultsQueue.DeleteCallCount);
+    }
+
+    [Fact]
+    public async Task ConsumeResult_JobIdMismatch_LeavesTicketUndeleted()
+    {
+        var resultsQueue = new FakeQueueClient(BuildValidResultTicketMessage());
+        var blobStore = new FakeBlobPayloadStore();
+        // Result blob at the ticket's path but with a different jobId inside.
+        blobStore.SeedResult(new InferenceResult
+        {
+            JobId = "different-job",
+            Status = "complete",
+            Result = "x",
+            CompletedAt = DateTimeOffset.UtcNow,
+        });
+        // The seed above went to results/different-job.json; place a mismatching
+        // blob at the ticket's expected path instead.
+        blobStore.SeedResultAt(BlobPayloadStore.ResultBlobPath(JobId), new InferenceResult
+        {
+            JobId = "different-job",
+            Status = "complete",
+            Result = "x",
+            CompletedAt = DateTimeOffset.UtcNow,
+        });
+
+        var agent = new QueueInferenceAgent(
+            resultsQueue, resultsQueue, blobStore, UnusedOllama(),
+            standardOut: TextWriter.Null);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => agent.ConsumeResultAsync(CancellationToken.None));
+
+        Assert.Contains("does not match", ex.Message);
         Assert.Equal(0, resultsQueue.DeleteCallCount);
     }
 
@@ -93,8 +160,10 @@ public class ConsumeResultTests
     {
         var output = new StringWriter();
         var resultsQueue = new FakeQueueClient(messageToReturn: null);
+        var blobStore = new FakeBlobPayloadStore();
+
         var agent = new QueueInferenceAgent(
-            resultsQueue, resultsQueue, UnusedOllama(),
+            resultsQueue, resultsQueue, blobStore, UnusedOllama(),
             standardOut: output);
 
         var consumed = await agent.ConsumeResultAsync(CancellationToken.None);

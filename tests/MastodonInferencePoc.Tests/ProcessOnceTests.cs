@@ -11,25 +11,34 @@ public class ProcessOnceTests
 {
     private const string MessageId = "msg-1";
     private const string PopReceipt = "pop-1";
+    private const string JobId = "job-abc";
 
-    private static QueueMessage BuildJobMessage()
+    private static QueueMessage BuildTicketMessage(JobTicket ticket)
     {
-        var job = new InferenceJob
-        {
-            JobId = "job-abc",
-            Type = "test",
-            Prompt = "hello",
-            CreatedAt = DateTimeOffset.UtcNow,
-        };
-
-        var body = JsonSerializer.Serialize(job, JsonDefaults.Options);
-
+        var body = JsonSerializer.Serialize(ticket, JsonDefaults.Options);
         return QueuesModelFactory.QueueMessage(
             messageId: MessageId,
             popReceipt: PopReceipt,
             body: BinaryData.FromString(body),
             dequeueCount: 1);
     }
+
+    private static JobTicket ValidTicket(DateTimeOffset? deadline = null) => new()
+    {
+        JobId = JobId,
+        Type = "test",
+        RequestBlob = BlobPayloadStore.RequestBlobPath(JobId),
+        CreatedAt = DateTimeOffset.UtcNow,
+        Deadline = deadline,
+    };
+
+    private static InferenceRequest RequestFor(string jobId) => new()
+    {
+        JobId = jobId,
+        Type = "test",
+        Prompt = "hello",
+        CreatedAt = DateTimeOffset.UtcNow,
+    };
 
     private static OllamaClient OllamaReturning(string response)
     {
@@ -50,81 +59,157 @@ public class ProcessOnceTests
     }
 
     [Fact]
-    public async Task Failure_DoesNotDeleteTheInputMessage()
+    public async Task Success_UploadsResultBlob_EnqueuesTicket_ThenDeletesInputOnce()
     {
-        var jobsQueue = new FakeQueueClient(BuildJobMessage());
+        var jobsQueue = new FakeQueueClient(BuildTicketMessage(ValidTicket()));
         var resultsQueue = new FakeQueueClient();
+        var blobStore = new FakeBlobPayloadStore();
+        blobStore.SeedRequest(RequestFor(JobId));
+
         var agent = new QueueInferenceAgent(
-            jobsQueue, resultsQueue, OllamaThatFails(),
-            standardError: TextWriter.Null);
-
-        // Ollama fails, so ProcessOnceAsync must throw and NOT delete the input.
-        await Assert.ThrowsAnyAsync<Exception>(
-            () => agent.ProcessOnceAsync(CancellationToken.None));
-
-        Assert.Equal(0, jobsQueue.DeleteCallCount);
-    }
-
-    [Fact]
-    public async Task Failure_MakesMessageVisibleAgainWithZeroTimeout()
-    {
-        var jobsQueue = new FakeQueueClient(BuildJobMessage());
-        var resultsQueue = new FakeQueueClient();
-        var agent = new QueueInferenceAgent(
-            jobsQueue, resultsQueue, OllamaThatFails(),
-            standardError: TextWriter.Null);
-
-        await Assert.ThrowsAnyAsync<Exception>(
-            () => agent.ProcessOnceAsync(CancellationToken.None));
-
-        // Exactly one UpdateMessageAsync, using the received id + pop receipt,
-        // content unchanged, visibility timeout zero.
-        Assert.Equal(1, jobsQueue.UpdateCallCount);
-        Assert.Equal(MessageId, jobsQueue.UpdatedMessageId);
-        Assert.Equal(PopReceipt, jobsQueue.UpdatedPopReceipt);
-        Assert.Equal(TimeSpan.Zero, jobsQueue.UpdatedVisibilityTimeout);
-
-        // Content left unchanged: the text passed back equals the received body.
-        var restored = JsonSerializer.Deserialize<InferenceJob>(
-            jobsQueue.UpdatedMessageText!, JsonDefaults.Options);
-        Assert.NotNull(restored);
-        Assert.Equal("job-abc", restored!.JobId);
-    }
-
-    [Fact]
-    public async Task Failure_OnResultEnqueue_DoesNotDeleteAndResetsVisibility()
-    {
-        var jobsQueue = new FakeQueueClient(BuildJobMessage());
-        var resultsQueue = new FakeQueueClient { FailOnSend = true };
-        var agent = new QueueInferenceAgent(
-            jobsQueue, resultsQueue, OllamaReturning("some output"),
-            standardError: TextWriter.Null);
-
-        await Assert.ThrowsAsync<InvalidOperationException>(
-            () => agent.ProcessOnceAsync(CancellationToken.None));
-
-        Assert.Equal(0, jobsQueue.DeleteCallCount);
-        Assert.Equal(1, jobsQueue.UpdateCallCount);
-        Assert.Equal(TimeSpan.Zero, jobsQueue.UpdatedVisibilityTimeout);
-    }
-
-    [Fact]
-    public async Task Success_DeletesTheInputExactlyOnceAndDoesNotResetVisibility()
-    {
-        var jobsQueue = new FakeQueueClient(BuildJobMessage());
-        var resultsQueue = new FakeQueueClient();
-        var agent = new QueueInferenceAgent(
-            jobsQueue, resultsQueue, OllamaReturning("Hello from Ollama via Azure Queue"),
+            jobsQueue, resultsQueue, blobStore, OllamaReturning("Hello from Ollama via Azure Queue"),
             standardOut: TextWriter.Null);
 
         var processed = await agent.ProcessOnceAsync(CancellationToken.None);
 
         Assert.True(processed);
-        Assert.Equal(1, resultsQueue.SendCallCount);
-        Assert.Equal(1, jobsQueue.DeleteCallCount);
+        Assert.Equal(1, blobStore.ResultUploadCount);      // result blob uploaded
+        Assert.Equal(1, resultsQueue.SendCallCount);       // result ticket enqueued
+        Assert.Equal(1, jobsQueue.DeleteCallCount);        // input deleted exactly once
         Assert.Equal(MessageId, jobsQueue.DeletedMessageId);
         Assert.Equal(PopReceipt, jobsQueue.DeletedPopReceipt);
-        // No visibility reset on the happy path.
-        Assert.Equal(0, jobsQueue.UpdateCallCount);
+        Assert.Equal(0, jobsQueue.UpdateCallCount);        // no visibility reset on success
+        Assert.Equal("Hello from Ollama via Azure Queue", blobStore.LastUploadedResult!.Result);
+    }
+
+    [Fact]
+    public async Task OllamaFailure_DoesNotUploadResult_DoesNotDelete_ResetsVisibility()
+    {
+        var jobsQueue = new FakeQueueClient(BuildTicketMessage(ValidTicket()));
+        var resultsQueue = new FakeQueueClient();
+        var blobStore = new FakeBlobPayloadStore();
+        blobStore.SeedRequest(RequestFor(JobId));
+
+        var agent = new QueueInferenceAgent(
+            jobsQueue, resultsQueue, blobStore, OllamaThatFails(),
+            standardError: TextWriter.Null);
+
+        await Assert.ThrowsAnyAsync<Exception>(
+            () => agent.ProcessOnceAsync(CancellationToken.None));
+
+        Assert.Equal(0, blobStore.ResultUploadCount);      // no success result uploaded
+        Assert.Equal(0, resultsQueue.SendCallCount);
+        Assert.Equal(0, jobsQueue.DeleteCallCount);        // input preserved
+        Assert.Equal(1, jobsQueue.UpdateCallCount);        // made visible again
+        Assert.Equal(TimeSpan.Zero, jobsQueue.UpdatedVisibilityTimeout);
+    }
+
+    [Fact]
+    public async Task ResultTicketEnqueueFailure_DoesNotDelete_ResetsVisibility()
+    {
+        var jobsQueue = new FakeQueueClient(BuildTicketMessage(ValidTicket()));
+        var resultsQueue = new FakeQueueClient { FailOnSend = true };
+        var blobStore = new FakeBlobPayloadStore();
+        blobStore.SeedRequest(RequestFor(JobId));
+
+        var agent = new QueueInferenceAgent(
+            jobsQueue, resultsQueue, blobStore, OllamaReturning("out"),
+            standardError: TextWriter.Null);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => agent.ProcessOnceAsync(CancellationToken.None));
+
+        // Result blob was uploaded before the enqueue, but the input is NOT
+        // deleted because the result ticket never made it onto the queue.
+        Assert.Equal(0, jobsQueue.DeleteCallCount);
+        Assert.Equal(1, jobsQueue.UpdateCallCount);
+    }
+
+    [Fact]
+    public async Task MissingRequestBlob_DoesNotDelete_ResetsVisibility()
+    {
+        // No SeedRequest: the referenced blob does not exist.
+        var jobsQueue = new FakeQueueClient(BuildTicketMessage(ValidTicket()));
+        var resultsQueue = new FakeQueueClient();
+        var blobStore = new FakeBlobPayloadStore();
+
+        var agent = new QueueInferenceAgent(
+            jobsQueue, resultsQueue, blobStore, OllamaReturning("out"),
+            standardError: TextWriter.Null);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => agent.ProcessOnceAsync(CancellationToken.None));
+
+        Assert.Equal(0, jobsQueue.DeleteCallCount);        // not silently lost
+        Assert.Equal(0, blobStore.ResultUploadCount);
+        Assert.Equal(1, jobsQueue.UpdateCallCount);
+    }
+
+    [Fact]
+    public async Task JobIdMismatchBetweenTicketAndBlob_IsRejected_DoesNotDelete()
+    {
+        var jobsQueue = new FakeQueueClient(BuildTicketMessage(ValidTicket()));
+        var resultsQueue = new FakeQueueClient();
+        var blobStore = new FakeBlobPayloadStore();
+        // Seed a request blob at the ticket's path but with a different jobId
+        // inside it - the agent must detect the mismatch.
+        blobStore.SeedRequestAt(BlobPayloadStore.RequestBlobPath(JobId), new InferenceRequest
+        {
+            JobId = "some-other-job",
+            Type = "test",
+            Prompt = "hello",
+            CreatedAt = DateTimeOffset.UtcNow,
+        });
+
+        var agent = new QueueInferenceAgent(
+            jobsQueue, resultsQueue, blobStore, OllamaReturning("out"),
+            standardError: TextWriter.Null);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => agent.ProcessOnceAsync(CancellationToken.None));
+
+        Assert.Contains("does not match", ex.Message);
+        Assert.Equal(0, jobsQueue.DeleteCallCount);
+        Assert.Equal(0, blobStore.ResultUploadCount);
+    }
+
+    [Fact]
+    public async Task ExpiredTicket_IsNotProcessed_DoesNotDelete()
+    {
+        var expired = ValidTicket(deadline: DateTimeOffset.UtcNow.AddMinutes(-5));
+        var jobsQueue = new FakeQueueClient(BuildTicketMessage(expired));
+        var resultsQueue = new FakeQueueClient();
+        var blobStore = new FakeBlobPayloadStore();
+        blobStore.SeedRequest(RequestFor(JobId));
+
+        var agent = new QueueInferenceAgent(
+            jobsQueue, resultsQueue, blobStore, OllamaReturning("out"),
+            standardError: TextWriter.Null);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => agent.ProcessOnceAsync(CancellationToken.None));
+
+        Assert.Contains("expired", ex.Message);
+        Assert.Equal(0, jobsQueue.DeleteCallCount);
+        Assert.Equal(0, blobStore.ResultUploadCount);
+    }
+
+    [Fact]
+    public async Task EmptyQueue_PrintsNoJob_ReturnsFalse()
+    {
+        var output = new StringWriter();
+        var jobsQueue = new FakeQueueClient(messageToReturn: null);
+        var resultsQueue = new FakeQueueClient();
+        var blobStore = new FakeBlobPayloadStore();
+
+        var agent = new QueueInferenceAgent(
+            jobsQueue, resultsQueue, blobStore, OllamaReturning("out"),
+            standardOut: output);
+
+        var processed = await agent.ProcessOnceAsync(CancellationToken.None);
+
+        Assert.False(processed);
+        Assert.Contains("No job available", output.ToString());
+        Assert.Equal(0, jobsQueue.DeleteCallCount);
     }
 }

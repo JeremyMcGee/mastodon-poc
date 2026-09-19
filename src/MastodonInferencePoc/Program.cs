@@ -47,11 +47,12 @@ catch (OperationCanceledException)
 static async Task<int> RunEnqueueTestAsync(CancellationToken cancellationToken)
 {
     var config = Configuration.FromEnvironment();
-    var jobsQueue = QueueInferenceAgent.CreateQueueClient(
-        config.RequireAzureStorageConnectionString(), config.JobsQueueName);
+    var connectionString = config.RequireAzureStorageConnectionString();
+    var jobsQueue = QueueInferenceAgent.CreateQueueClient(connectionString, config.JobsQueueName);
+    var blobStore = new BlobPayloadStore(connectionString, config.BlobContainerName);
 
     // Ollama isn't needed to enqueue; pass a placeholder client that is never called.
-    var agent = new QueueInferenceAgent(jobsQueue, jobsQueue, CreateUnusedOllamaClient());
+    var agent = new QueueInferenceAgent(jobsQueue, jobsQueue, blobStore, CreateUnusedOllamaClient());
 
     var jobId = await agent.EnqueueTestJobAsync(cancellationToken).ConfigureAwait(false);
     Console.WriteLine(jobId);
@@ -66,11 +67,12 @@ static async Task<int> RunProcessOnceAsync(CancellationToken cancellationToken)
 
     var jobsQueue = QueueInferenceAgent.CreateQueueClient(connectionString, config.JobsQueueName);
     var resultsQueue = QueueInferenceAgent.CreateQueueClient(connectionString, config.ResultsQueueName);
+    var blobStore = new BlobPayloadStore(connectionString, config.BlobContainerName);
 
     using var httpClient = CreateOllamaHttpClient(config.OllamaBaseUrl);
     var ollamaClient = new OllamaClient(httpClient, model);
 
-    var agent = new QueueInferenceAgent(jobsQueue, resultsQueue, ollamaClient);
+    var agent = new QueueInferenceAgent(jobsQueue, resultsQueue, blobStore, ollamaClient);
 
     try
     {
@@ -89,10 +91,11 @@ static async Task<int> RunProcessOnceAsync(CancellationToken cancellationToken)
 static async Task<int> RunPeekResultAsync(CancellationToken cancellationToken)
 {
     var config = Configuration.FromEnvironment();
-    var resultsQueue = QueueInferenceAgent.CreateQueueClient(
-        config.RequireAzureStorageConnectionString(), config.ResultsQueueName);
+    var connectionString = config.RequireAzureStorageConnectionString();
+    var resultsQueue = QueueInferenceAgent.CreateQueueClient(connectionString, config.ResultsQueueName);
+    var blobStore = new BlobPayloadStore(connectionString, config.BlobContainerName);
 
-    var agent = new QueueInferenceAgent(resultsQueue, resultsQueue, CreateUnusedOllamaClient());
+    var agent = new QueueInferenceAgent(resultsQueue, resultsQueue, blobStore, CreateUnusedOllamaClient());
 
     await agent.PeekResultAsync(cancellationToken).ConfigureAwait(false);
     return 0;
@@ -101,10 +104,11 @@ static async Task<int> RunPeekResultAsync(CancellationToken cancellationToken)
 static async Task<int> RunConsumeResultAsync(CancellationToken cancellationToken)
 {
     var config = Configuration.FromEnvironment();
-    var resultsQueue = QueueInferenceAgent.CreateQueueClient(
-        config.RequireAzureStorageConnectionString(), config.ResultsQueueName);
+    var connectionString = config.RequireAzureStorageConnectionString();
+    var resultsQueue = QueueInferenceAgent.CreateQueueClient(connectionString, config.ResultsQueueName);
+    var blobStore = new BlobPayloadStore(connectionString, config.BlobContainerName);
 
-    var agent = new QueueInferenceAgent(resultsQueue, resultsQueue, CreateUnusedOllamaClient());
+    var agent = new QueueInferenceAgent(resultsQueue, resultsQueue, blobStore, CreateUnusedOllamaClient());
 
     try
     {
@@ -145,8 +149,8 @@ static void PrintUsage()
     Console.WriteLine("  dotnet run --project src/MastodonInferencePoc -- <command>");
     Console.WriteLine();
     Console.WriteLine("Commands:");
-    Console.WriteLine("  enqueue-test   Send a test job to the jobs queue and print its id.");
-    Console.WriteLine("  process-once   Receive one job, run Ollama, write the result, then delete the job.");
-    Console.WriteLine("  peek-result    Peek (non-destructively) at one message in the results queue.");
-    Console.WriteLine("  consume-result Receive, print, and delete one message from the results queue.");
+    Console.WriteLine("  enqueue-test   Upload a test request blob, then enqueue a job ticket. Prints the job id.");
+    Console.WriteLine("  process-once   Receive a job ticket, run Ollama, write the result blob + ticket, then delete the job.");
+    Console.WriteLine("  peek-result    Peek a result ticket, download the result blob, and print it (non-destructive).");
+    Console.WriteLine("  consume-result Receive a result ticket, download and print the result blob, then delete the ticket.");
 }

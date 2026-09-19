@@ -9,25 +9,29 @@ public sealed class Configuration
     public const string DefaultOllamaBaseUrl = "http://127.0.0.1:11434";
     public const string DefaultJobsQueue = "inference-jobs";
     public const string DefaultResultsQueue = "inference-results";
+    public const string DefaultBlobContainer = "inference-data";
 
     public string? AzureStorageConnectionString { get; }
     public string OllamaBaseUrl { get; }
     public string? OllamaModel { get; }
     public string JobsQueueName { get; }
     public string ResultsQueueName { get; }
+    public string BlobContainerName { get; }
 
     private Configuration(
         string? azureStorageConnectionString,
         string ollamaBaseUrl,
         string? ollamaModel,
         string jobsQueueName,
-        string resultsQueueName)
+        string resultsQueueName,
+        string blobContainerName)
     {
         AzureStorageConnectionString = azureStorageConnectionString;
         OllamaBaseUrl = ollamaBaseUrl;
         OllamaModel = ollamaModel;
         JobsQueueName = jobsQueueName;
         ResultsQueueName = resultsQueueName;
+        BlobContainerName = blobContainerName;
     }
 
     /// <summary>
@@ -50,7 +54,8 @@ public sealed class Configuration
             ollamaBaseUrl: Trimmed(lookup("OLLAMA_BASE_URL")) ?? DefaultOllamaBaseUrl,
             ollamaModel: Trimmed(lookup("OLLAMA_MODEL")),
             jobsQueueName: Trimmed(lookup("INFERENCE_JOBS_QUEUE")) ?? DefaultJobsQueue,
-            resultsQueueName: Trimmed(lookup("INFERENCE_RESULTS_QUEUE")) ?? DefaultResultsQueue);
+            resultsQueueName: Trimmed(lookup("INFERENCE_RESULTS_QUEUE")) ?? DefaultResultsQueue,
+            blobContainerName: Trimmed(lookup("INFERENCE_BLOB_CONTAINER")) ?? DefaultBlobContainer);
     }
 
     /// <summary>
