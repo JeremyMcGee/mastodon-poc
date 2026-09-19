@@ -153,15 +153,23 @@ This is the important part of the PoC, so it is spelled out explicitly.
 Why this order matters:
 
 - If Ollama fails, or writing the result fails, the code **does not delete** the
-  input message and exits non-zero. Because the message was only hidden (not
-  deleted), it becomes **visible again** once the visibility timeout expires, so
-  the job can be retried on a later `process-once` run. No work is silently lost.
-- If the process crashes between receiving and deleting, the same thing happens:
-  the message reappears after the timeout.
-- The delete requires the `PopReceipt` returned by the receive call. If the
-  visibility timeout had already expired and another reader picked the message
-  up, the original `PopReceipt` would be stale and the delete would fail, which
-  is the queue protecting you from double-deletion.
+  input message and exits non-zero. Instead, as a best-effort step, it calls
+  `UpdateMessageAsync` with the received `MessageId` and `PopReceipt`, leaving
+  the message content unchanged and setting the visibility timeout to
+  `TimeSpan.Zero`. That makes the job **immediately visible again**, so the very
+  next `process-once` run can retry it without waiting out the ~2-minute
+  timeout. No work is silently lost.
+- If resetting the visibility also fails (for example, the pop receipt is
+  already stale), that secondary failure is logged to stderr but the original
+  processing exception is preserved and rethrown, and the process still exits
+  non-zero. The message then simply reappears after the normal visibility
+  timeout instead of immediately.
+- If the process crashes outright between receiving and deleting, no reset runs,
+  so the message reappears after the timeout.
+- The delete (and the visibility reset) require the `PopReceipt` returned by the
+  receive call. If the visibility timeout had already expired and another reader
+  picked the message up, the original `PopReceipt` would be stale and the call
+  would fail, which is the queue protecting you from double-processing.
 
 The trade-off is that a job could be processed more than once (for example, if
 inference takes longer than the visibility timeout, or the result is enqueued

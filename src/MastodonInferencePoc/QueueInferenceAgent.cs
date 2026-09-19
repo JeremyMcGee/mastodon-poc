@@ -89,32 +89,72 @@ public sealed class QueueInferenceAgent
             return false;
         }
 
-        var job = JsonSerializer.Deserialize<InferenceJob>(message.MessageText, JsonDefaults.Options)
-            ?? throw new InvalidOperationException("Job message could not be deserialized.");
-
-        // Step 2: call Ollama.
-        var responseText = await _ollamaClient.GenerateAsync(job.Prompt, cancellationToken).ConfigureAwait(false);
-
-        // Step 3: enqueue the result. If this throws, we do NOT delete the input,
-        // so the job reappears after the visibility timeout and can be retried.
-        var result = new InferenceResult
+        // From here on the message has been received (and is invisible for the
+        // visibility timeout). If anything fails, we make it visible again
+        // immediately instead of waiting for the timeout to expire.
+        try
         {
-            JobId = job.JobId,
-            Status = "complete",
-            Result = responseText,
-            CompletedAt = DateTimeOffset.UtcNow,
-        };
+            var job = JsonSerializer.Deserialize<InferenceJob>(message.MessageText, JsonDefaults.Options)
+                ?? throw new InvalidOperationException("Job message could not be deserialized.");
 
-        var resultPayload = JsonSerializer.Serialize(result, JsonDefaults.Options);
-        await _resultsQueue.SendMessageAsync(resultPayload, cancellationToken).ConfigureAwait(false);
+            // Step 2: call Ollama.
+            var responseText = await _ollamaClient.GenerateAsync(job.Prompt, cancellationToken).ConfigureAwait(false);
 
-        // Step 4: only now is it safe to remove the input message.
-        await _jobsQueue
-            .DeleteMessageAsync(message.MessageId, message.PopReceipt, cancellationToken)
-            .ConfigureAwait(false);
+            // Step 3: enqueue the result. If this throws, we do NOT delete the input.
+            var result = new InferenceResult
+            {
+                JobId = job.JobId,
+                Status = "complete",
+                Result = responseText,
+                CompletedAt = DateTimeOffset.UtcNow,
+            };
 
-        _out.WriteLine($"Processed job {job.JobId}");
-        return true;
+            var resultPayload = JsonSerializer.Serialize(result, JsonDefaults.Options);
+            await _resultsQueue.SendMessageAsync(resultPayload, cancellationToken).ConfigureAwait(false);
+
+            // Step 4: only now is it safe to remove the input message.
+            await _jobsQueue
+                .DeleteMessageAsync(message.MessageId, message.PopReceipt, cancellationToken)
+                .ConfigureAwait(false);
+
+            _out.WriteLine($"Processed job {job.JobId}");
+            return true;
+        }
+        catch (Exception)
+        {
+            // Best-effort: make the message visible again immediately so an
+            // immediate retry can pick it up rather than waiting out the
+            // visibility timeout. The message is NOT deleted and its content is
+            // left unchanged. Any failure here is logged but must not mask the
+            // original processing failure, so we always rethrow it.
+            await TryMakeVisibleAgainAsync(message, cancellationToken).ConfigureAwait(false);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Best-effort reset of a message's visibility timeout to zero (immediately
+    /// visible), leaving its content unchanged. Never throws: a secondary
+    /// failure is logged so the caller can rethrow the original exception.
+    /// </summary>
+    private async Task TryMakeVisibleAgainAsync(QueueMessage message, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await _jobsQueue
+                .UpdateMessageAsync(
+                    message.MessageId,
+                    message.PopReceipt,
+                    message.MessageText,
+                    TimeSpan.Zero,
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _error.WriteLine(
+                $"Failed to make job message {message.MessageId} visible again: {ex.Message}");
+        }
     }
 
     /// <summary>
